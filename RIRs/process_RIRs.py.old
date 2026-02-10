@@ -39,34 +39,7 @@ envelope calculation, octave filtering and STI computation.
 import os
 import numpy as np
 from scipy import signal
-# Attempt to import librosa for audio loading.  In environments where
-# librosa is not available, fall back to a minimal stub that uses
-# ``scipy.io.wavfile.read`` to load WAV files.  Resampling is not
-# supported because this module never requests a sampling rate other than
-# the file's native rate (``sr=None``).
-try:
-    import librosa  # type: ignore
-except ImportError:
-    import types as _types
-    import numpy as _np
-    from scipy.io import wavfile as _wavfile
-    _librosa_stub = _types.ModuleType("librosa_stub")
-
-    def _stub_load(file_path: str, sr=None, mono: bool = True):
-        fs, data = _wavfile.read(file_path)
-        # Convert integer arrays to float
-        if data.dtype.kind in ('i', 'u'):
-            max_val = _np.iinfo(data.dtype).max
-            data = data.astype(_np.float32) / float(max_val)
-        else:
-            data = data.astype(_np.float32)
-        # Average channels to mono if requested
-        if mono and data.ndim > 1:
-            data = _np.mean(data, axis=1)
-        return data, fs
-
-    _librosa_stub.load = _stub_load  # type: ignore
-    librosa = _librosa_stub  # type: ignore
+import librosa
 from scipy.signal import hilbert, butter, sosfiltfilt, filtfilt
 from tqdm import tqdm
 
@@ -140,11 +113,8 @@ def extract_position(filename: str) -> str:
 
 
 def _align_onset(
-    rir: np.ndarray,
-    fs: int,
-    thresh_db: float = 20.0,
-    pre_ms: float = 2.0,
-    max_ms: float = 300.0,
+    rir: np.ndarray, fs: int, thresh_db: float = 12.0, pre_ms: float = 2.0,
+    max_ms: float = 300.0
 ) -> tuple[np.ndarray, float]:
     """Align the onset of the direct sound to the beginning of the signal.
 
@@ -169,12 +139,12 @@ def _align_onset(
     """
     x = rir.astype(float) - np.mean(rir)
     # Envelope via Hilbert transform magnitude
-    env = np.abs(hilbert(x))
+    env = envelope_db(x, fs, 5)
     # Determine the index for the noise floor estimation
     n0 = min(len(env), int(0.2 * fs), int(max_ms / 1000.0 * fs))
     noise = np.median(env[:max(1, n0)]) + 1e-12
     # Threshold above noise floor
-    thr = noise * (10.0 ** (thresh_db / 20.0))
+    thr = -thresh_db
     above = np.nonzero(env > thr)[0]
     # If nothing exceeds the threshold, return the original signal
     if len(above) == 0:
@@ -710,44 +680,94 @@ def main() -> None:
     out_csv = os.path.join(rir_directory, "rir_parameters_per_file.csv")
     with open(out_csv, "w", encoding="utf-8", newline="") as f:
         f.write("Filename;STI;C50_dB;D50_percent;T30_s\n")
-    # Process each RIR file individually.  Align each channel independently,
-    # normalise by its global peak and compute the acoustic parameters.  This
-    # avoids the systematic underestimation of early energy that occurs when
-    # pairing files with different onset times.
-    for file in sorted(rir_files):
-        file_path = os.path.join(rir_directory, file)
-        # Load the raw RIR (with high‑pass filtering)
-        rir_raw, fs = load_rir(file_path)
-        # Align the onset using a raised threshold (default 20 dB above noise)
-        rir_aligned, t0 = _align_onset(rir_raw, fs)
-        # Normalise by the global peak to reduce level differences
-        peak = np.max(np.abs(rir_aligned)) + 1e-12
-        rir = rir_aligned / peak
-        # Compute acoustic parameters on the aligned and normalised RIR
-        sti, TI, c50, d50, t30 = calculate_parameters(rir, fs)
-        # Store for summary
-        sti_values.append(sti)
-        c50_values.append(c50)
-        d50_values.append(d50)
-        t30_values.append(t30)
-        # Format the filename without extension for reporting
-        position = extract_position(file)
-        # Print human‑readable result
-        print(
-            f"{position}: STI={sti:.3f}, C50={c50:.2f} dB, D50={d50/100.0:.4f}, T30={t30:.2f} s"
-        )
-        # Helper to format numeric values for CSV
-        def _fmt(x: float, nd: int) -> str:
-            return "" if not np.isfinite(x) else f"{x:.{nd}f}".replace(".", ",")
-        # Append the result to the CSV file
-        with open(out_csv, "a", encoding="utf-8", newline="") as f:
-            f.write(
-                f"{position};"
-                f"{_fmt(sti, 3)};"
-                f"{_fmt(c50, 2)};"
-                f"{_fmt(d50 / 100.0, 4)};"
-                f"{_fmt(t30, 2)}\n"
+    # Group files by base name (before _left_RIR/_right_RIR or other suffixes)
+    groups: dict[str, list[str]] = {}
+    for file in rir_files:
+        base = file
+        # Remove suffixes commonly used for channel identification
+        for suffix in ["_left_RIR.wav", "_right_RIR.wav", "_left.wav", "_right.wav"]:
+            if base.endswith(suffix):
+                base = base[:-len(suffix)]
+                break
+        groups.setdefault(base, []).append(file)
+    # Process each group of potentially paired RIR files
+    for base, files_in_group in groups.items():
+        # Map from filename to onset time
+        onset_times: dict[str, float] = {}
+        # Load each RIR and determine its onset
+        rirs_raw: dict[str, tuple[np.ndarray, int]] = {}
+        for file in files_in_group:
+            file_path = os.path.join(rir_directory, file)
+            rir_raw, fs = load_rir(file_path)
+            # Determine onset and keep raw RIR for later cropping
+            rir_aligned_tmp, t0 = _align_onset(rir_raw, fs)
+            rirs_raw[file] = (rir_raw, fs)
+            onset_times[file] = t0
+        # Use the earliest onset among channels as the common reference
+        common_t0 = min(onset_times.values())
+        # Determine a common tail cut for the group to avoid differences due to
+        # extended noise floor.  For each channel, estimate where the energy
+        # decay drops below a threshold (−45 dB relative to peak, fallback
+        # −35 dB).  The earliest of these cut points is used for all
+        # channels in the group to enforce identical tail length.
+        cut_indices: dict[str, int] = {}
+        for file in files_in_group:
+            rir_raw, fs = rirs_raw[file]
+            # Crop to the common onset
+            i0 = int(common_t0 * fs)
+            rir_tmp = rir_raw[i0:]
+            # Compute noise‑corrected energy decay curve
+            edc = _schroeder_edc_noise_corrected(rir_tmp, fs, tail_ms=500.0, min_tail_frac=0.1)
+            edc_db = 10.0 * np.log10(edc / np.max(edc) + 1e-30)
+            cut_db = -45.0
+            if not np.any(edc_db < cut_db):
+                cut_db = -35.0
+            below = np.nonzero(edc_db < cut_db)[0]
+            if below.size:
+                idx = int(below[0])
+                # Add 100 ms buffer after the point where the curve falls below the threshold
+                cut_idx = min(len(rir_tmp), idx + int(0.1 * fs))
+            else:
+                cut_idx = len(rir_tmp)
+            cut_indices[file] = cut_idx
+        # Common cut is the minimum across all channels to ensure that the late
+        # tail does not include noise for any channel
+        common_cut = min(cut_indices.values()) if cut_indices else None
+        for file in files_in_group:
+            rir_raw, fs = rirs_raw[file]
+            # Crop at onset and tail
+            i0 = int(common_t0 * fs)
+            rir_tmp = rir_raw[i0:]
+            if common_cut is not None:
+                rir = rir_tmp[:common_cut]
+            else:
+                rir = rir_tmp
+            # Normalise the first 80 ms to unity to reduce level differences
+            n80 = max(1, int(0.08 * fs))
+            peak = np.max(np.abs(rir[:min(len(rir), n80)])) + 1e-12
+            rir = rir / peak
+            position = extract_position(file)
+            # Compute acoustic parameters on the aligned, trimmed and normalised RIR
+            sti, TI, c50, d50, t30 = calculate_parameters(rir, fs)
+            sti_values.append(sti)
+            c50_values.append(c50)
+            d50_values.append(d50)
+            t30_values.append(t30)
+            print(
+                f"{position}: STI={sti:.3f}, C50={c50:.2f} dB, D50={d50/100.0:.4f}, T30={t30:.2f} s"
             )
+            # Helper to format numeric values for CSV
+            def _fmt(x: float, nd: int) -> str:
+                return "" if not np.isfinite(x) else f"{x:.{nd}f}".replace(".", ",")
+            # Append results to CSV
+            with open(out_csv, "a", encoding="utf-8", newline="") as f:
+                f.write(
+                    f"{position};"
+                    f"{_fmt(sti, 3)};"
+                    f"{_fmt(c50, 2)};"
+                    f"{_fmt(d50 / 100.0, 4)};"
+                    f"{_fmt(t30, 2)}\n"
+                )
             # Print bandwise T30 values for diagnostic purposes
             bandvals = bandwise_params(rir, fs)
             print("Bandwise T30 estimates:")
