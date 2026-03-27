@@ -16,20 +16,35 @@ The implementation follows established standards such as ISO 3382-1 and IEC 6026
 
 ## Repository Structure
 RIR_Evaluation/
+
 │
+
 ├── RIRs/                                   # Example room impulse responses
+
 ├── calculate_ir.py                         # Compute room impulse responses from sweep recordings
+
 ├── process_folder.py                       # Batch evaluation of RIR files / parameter extraction
+
 ├── Log_Sweep_50_Hz-20_kHz.wav              # Excitation sweep signal
+
 ├── Mo_R114_1-1.wav                         # Example measurement
+
 ├── Mo_R114_1-2.wav
+
 ├── Mo_R114_1-3.wav
+
 ├── Mo_R114_2-1.wav
+
 ├── Mo_R114_2-2.wav
+
 ├── Mo_R114_2-3.wav
-├── 25-09-02 Evaluationsbogen Raumakustikstudie.pdf
+
+├── 26-03-27 Zwischen Absorption und Streuung – Einfluss der Raumkanten auf die akustische.pdf # Conference Proceeding
+
 ├── LICENSE
+
 └── README.md
+
 
 ## Purpose
 The repository demonstrates how to:
